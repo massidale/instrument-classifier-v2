@@ -1,0 +1,46 @@
+# ---------------------------------------------------------------------------
+# Default configuration for IRMAS instrument classification (PANNs CNN14).
+# Every hyperparameter lives here — no magic numbers in the code.
+# ---------------------------------------------------------------------------
+
+seed: 42
+device: auto          # auto | cpu | cuda | mps
+output_dir: outputs   # checkpoints, metrics.json, tensorboard logs
+
+data:
+  train_dir: data/IRMAS-TrainingData      # folder-per-class single-label clips (3s)
+  test_dir: data/IRMAS-TestingData        # variable-length clips + .txt multi-label
+  val_fraction: 0.15                       # stratified holdout of the training data
+  sample_rate: 32000                       # PANNs CNN14 operates at 32 kHz
+  clip_seconds: 3.0                        # fixed training window length
+  num_workers: 4
+
+augment:
+  enabled: true
+  gain_db: 6.0          # random gain in [-gain_db, +gain_db]
+  noise_snr_db: 20.0    # add gaussian noise down to this SNR (higher = subtler)
+  mixup_alpha: 0.4      # Beta(alpha, alpha); 0 disables mixup
+
+model:
+  pretrained_path: checkpoints/pretrained/Cnn14_mAP=0.431.pth
+  num_classes: 11
+
+train:
+  batch_size: 32
+  # Phase 1: freeze the backbone, train only the new head.
+  warmup_epochs: 3
+  warmup_lr: 1.0e-3
+  # Phase 2: unfreeze everything, discriminative LR + cosine decay.
+  finetune_epochs: 30
+  head_lr: 5.0e-4
+  backbone_lr: 5.0e-5
+  weight_decay: 1.0e-4
+  early_stopping_patience: 8
+  amp: true             # automatic mixed precision (cuda only; ignored on mps/cpu)
+
+eval:
+  window_seconds: 3.0   # sliding-window length over test clips
+  hop_seconds: 1.0      # window hop
+  aggregate: mean       # mean | max over window sigmoid scores
+  # Threshold tuned on the val split; this is the fallback if none is provided.
+  default_threshold: 0.5

@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Environments
+.venv/
+venv/
+
+# Data & artifacts (large, downloaded/generated — not versioned)
+data/IRMAS-TrainingData/
+data/IRMAS-TestingData*/
+checkpoints/*.pth
+checkpoints/pretrained/
+runs/
+outputs/
+*.wav
+
+# OS
+.DS_Store
