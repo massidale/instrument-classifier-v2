@@ -1,8 +1,10 @@
 import numpy as np
 import pytest
 
+from instrument_classifier.data.labels import IRMAS_CLASSES
 from instrument_classifier.metrics import (
     multilabel_metrics,
+    per_class_f1,
     tune_threshold,
 )
 
@@ -45,3 +47,14 @@ def test_tune_threshold_returns_scalar_in_candidate_set():
     candidates = np.array([0.2, 0.5, 0.7])
     best_t, _ = tune_threshold(y_true, y_scores, candidates=candidates)
     assert best_t in candidates
+
+
+def test_per_class_f1_keys_and_values():
+    n = len(IRMAS_CLASSES)
+    y_true = np.zeros((4, n)); y_pred = np.zeros((4, n))
+    y_true[:, 0] = 1.0; y_pred[:, 0] = 1.0          # class 0 perfect
+    y_true[:2, 1] = 1.0                              # class 1 never predicted
+    scores = per_class_f1(y_true, y_pred)
+    assert list(scores) == list(IRMAS_CLASSES)
+    assert scores[IRMAS_CLASSES[0]] == 1.0
+    assert scores[IRMAS_CLASSES[1]] == 0.0

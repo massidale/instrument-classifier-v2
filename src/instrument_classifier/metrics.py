@@ -8,7 +8,9 @@ weights rare instruments equally with common ones.
 from __future__ import annotations
 
 import numpy as np
-from sklearn.metrics import precision_recall_fscore_support
+from sklearn.metrics import f1_score, precision_recall_fscore_support
+
+from .data.labels import IRMAS_CLASSES
 
 
 def multilabel_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
@@ -28,6 +30,18 @@ def multilabel_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, floa
         metrics[f"{avg}_recall"] = float(r)
         metrics[f"{avg}_f1"] = float(f1)
     return metrics
+
+
+def per_class_f1(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
+    """F1 per IRMAS class — the 'which instruments are hard' table.
+
+    ``y_true`` and ``y_pred`` are ``(n_samples, 11)`` with values in {0, 1}.
+    Returns a dict keyed by IRMAS class code, in ``IRMAS_CLASSES`` order.
+    """
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    scores = f1_score(y_true, y_pred, average=None, zero_division=0)
+    return {code: float(s) for code, s in zip(IRMAS_CLASSES, scores)}
 
 
 def tune_threshold(
