@@ -1,4 +1,7 @@
-"""Two-phase finetuning of CNN14 on IRMAS, with threshold tuning + test eval."""
+"""Two-phase training of MultiBranchNet on precomputed IRMAS features:
+(1) warmup with frozen ResNet backbones, (2) full finetuning with
+discriminative LRs + cosine decay + early stopping. Threshold tuned on the
+validation split; final evaluation on the official IRMAS test set."""
 
 from __future__ import annotations
 
@@ -10,35 +13,27 @@ import torch
 import torch.nn as nn
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Subset
-from tqdm import tqdm
 
-from .data.dataset import IRMASTestDataset, IRMASTrainDataset
-from .data.transforms import AugmentTransform, mixup_batch
+from .data.dataset import IRMASFeaturesDataset, IRMASTestDataset
+from .data.transforms import SpecAugment, mixup_batch
 from .evaluate import evaluate_scores, gather_test_scores
-from .metrics import multilabel_metrics, tune_threshold
-from .models.cnn14 import build_cnn14_finetune
+from .features import FeatureConfig
+from .metrics import tune_threshold
+from .models.multibranch import build_model
 from .utils import load_config, resolve_device, save_checkpoint, save_metrics, set_seed
 
 
-def train_one_epoch(
-    model: nn.Module,
-    loader: DataLoader,
-    optimizer: torch.optim.Optimizer,
-    device: torch.device,
-    criterion: nn.Module,
-    mixup_alpha: float = 0.0,
-    generator: torch.Generator | None = None,
-) -> float:
-    """Run one training epoch; return the mean batch loss."""
+def train_one_epoch(model, loader, optimizer, device, criterion,
+                    mixup_alpha=0.0, generator=None) -> float:
     model.train()
     total, n = 0.0, 0
-    for wav, target in loader:
-        wav, target = wav.to(device), target.to(device)
+    for feats, target in loader:
+        feats = {k: v.to(device) for k, v in feats.items()}
+        target = target.to(device)
         if mixup_alpha > 0:
-            wav, target = mixup_batch(wav, target, mixup_alpha, generator=generator)
+            feats, target = mixup_batch(feats, target, mixup_alpha, generator=generator)
         optimizer.zero_grad()
-        logits = model(wav)["logits"]
-        loss = criterion(logits, target)
+        loss = criterion(model(feats)["logits"], target)
         loss.backward()
         optimizer.step()
         total += loss.item()
@@ -47,24 +42,21 @@ def train_one_epoch(
 
 
 @torch.no_grad()
-def score_fixed_clips(
-    model: nn.Module, loader: DataLoader, device: torch.device
-) -> tuple[np.ndarray, np.ndarray]:
-    """Sigmoid scores for fixed-length clips (one forward each). -> (y_true, y_scores)."""
+def score_fixed_clips(model, loader, device) -> tuple[np.ndarray, np.ndarray]:
+    """Sigmoid scores for fixed-length validation clips -> (y_true, y_scores)."""
     model.eval()
     y_true, y_scores = [], []
-    for wav, target in loader:
-        logits = model(wav.to(device))["logits"]
+    for feats, target in loader:
+        logits = model({k: v.to(device) for k, v in feats.items()})["logits"]
         y_scores.append(torch.sigmoid(logits).cpu().numpy())
         y_true.append(target.numpy())
     return np.concatenate(y_true), np.concatenate(y_scores)
 
 
-def _stratified_split(dataset: IRMASTrainDataset, val_fraction: float, seed: int):
+def _stratified_split(dataset: IRMASFeaturesDataset, val_fraction: float, seed: int):
     idx = np.arange(len(dataset))
     train_idx, val_idx = train_test_split(
-        idx, test_size=val_fraction, random_state=seed, stratify=dataset.targets()
-    )
+        idx, test_size=val_fraction, random_state=seed, stratify=dataset.targets())
     return train_idx.tolist(), val_idx.tolist()
 
 
@@ -72,28 +64,25 @@ def run_training(config: dict) -> dict:
     set_seed(config["seed"])
     device = resolve_device(config["device"])
     data_cfg, train_cfg, aug_cfg = config["data"], config["train"], config["augment"]
+    active = [k for k, on in config["branches"].items() if on]
+    features_dir = Path(data_cfg["features_dir"]) / "train"
 
-    aug = (
-        AugmentTransform(aug_cfg["gain_db"], aug_cfg["noise_snr_db"], seed=config["seed"])
-        if aug_cfg["enabled"]
-        else None
-    )
-    full_aug = IRMASTrainDataset(
-        data_cfg["train_dir"], data_cfg["sample_rate"], data_cfg["clip_seconds"], transform=aug
-    )
-    full_plain = IRMASTrainDataset(
-        data_cfg["train_dir"], data_cfg["sample_rate"], data_cfg["clip_seconds"], transform=None
-    )
+    sa_cfg = aug_cfg["specaugment"]
+    transform = (SpecAugment(sa_cfg["time_masks"], sa_cfg["time_width"],
+                             sa_cfg["freq_masks"], sa_cfg["freq_width"],
+                             seed=config["seed"])
+                 if sa_cfg["enabled"] else None)
+    full_aug = IRMASFeaturesDataset(features_dir, active, transform=transform)
+    full_plain = IRMASFeaturesDataset(features_dir, active, transform=None)
     train_idx, val_idx = _stratified_split(full_plain, data_cfg["val_fraction"], config["seed"])
-    train_ds, val_ds = Subset(full_aug, train_idx), Subset(full_plain, val_idx)
+    train_loader = DataLoader(Subset(full_aug, train_idx),
+                              batch_size=train_cfg["batch_size"], shuffle=True,
+                              num_workers=data_cfg["num_workers"], drop_last=True)
+    val_loader = DataLoader(Subset(full_plain, val_idx),
+                            batch_size=train_cfg["batch_size"],
+                            num_workers=data_cfg["num_workers"])
 
-    train_loader = DataLoader(
-        train_ds, batch_size=train_cfg["batch_size"], shuffle=True,
-        num_workers=data_cfg["num_workers"], drop_last=True,
-    )
-    val_loader = DataLoader(val_ds, batch_size=train_cfg["batch_size"], num_workers=data_cfg["num_workers"])
-
-    model = build_cnn14_finetune(config["model"]["num_classes"], config["model"]["pretrained_path"]).to(device)
+    model = build_model(config).to(device)
     criterion = nn.BCEWithLogitsLoss()
     gen = torch.Generator().manual_seed(config["seed"])
 
@@ -104,48 +93,68 @@ def run_training(config: dict) -> dict:
 
     def validate() -> tuple[float, float]:
         y_true, y_scores = score_fixed_clips(model, val_loader, device)
-        t, f1 = tune_threshold(y_true, y_scores, candidates)
-        return t, f1
+        return tune_threshold(y_true, y_scores, candidates)
 
-    # Phase 1: freeze backbone, train only the new head.
-    model.freeze_backbone()
-    opt = torch.optim.Adam(model.param_groups(train_cfg["backbone_lr"], train_cfg["warmup_lr"]),
-                           weight_decay=train_cfg["weight_decay"])
-    for epoch in range(train_cfg["warmup_epochs"]):
-        loss = train_one_epoch(model, train_loader, opt, device, criterion, aug_cfg["mixup_alpha"], gen)
-        t, f1 = validate()
-        print(f"[warmup {epoch+1}/{train_cfg['warmup_epochs']}] loss={loss:.4f} val_microF1={f1:.4f}")
-
-    # Phase 2: unfreeze everything, discriminative LR + cosine decay, early stopping.
-    model.unfreeze_backbone()
-    opt = torch.optim.Adam(model.param_groups(train_cfg["backbone_lr"], train_cfg["head_lr"]),
-                           weight_decay=train_cfg["weight_decay"])
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=train_cfg["finetune_epochs"])
-    for epoch in range(train_cfg["finetune_epochs"]):
-        loss = train_one_epoch(model, train_loader, opt, device, criterion, aug_cfg["mixup_alpha"], gen)
-        sched.step()
-        t, f1 = validate()
-        print(f"[finetune {epoch+1}/{train_cfg['finetune_epochs']}] loss={loss:.4f} val_microF1={f1:.4f}")
+    def checkpoint_if_best(f1: float, t: float) -> None:
+        nonlocal best_f1, best_threshold, patience
         if f1 > best_f1:
             best_f1, best_threshold, patience = f1, t, 0
-            save_checkpoint(ckpt_path, model, extra={"threshold": best_threshold, "val_micro_f1": best_f1})
+            save_checkpoint(ckpt_path, model, extra={
+                "threshold": best_threshold, "val_micro_f1": best_f1,
+                "branches": config["branches"], "stats": full_plain.stats})
         else:
             patience += 1
-            if patience >= train_cfg["early_stopping_patience"]:
-                print(f"Early stopping at epoch {epoch+1}")
-                break
 
-    # Final evaluation on the official IRMAS test set using the tuned threshold.
-    results = {"val_micro_f1": best_f1, "threshold": best_threshold}
+    # Phase 1: frozen ResNet backbones — train head + scratch branches.
+    model.freeze_backbones()
+    opt = torch.optim.Adam(model.param_groups(train_cfg["backbone_lr"],
+                                              train_cfg["warmup_lr"]),
+                           weight_decay=train_cfg["weight_decay"])
+    for epoch in range(train_cfg["warmup_epochs"]):
+        loss = train_one_epoch(model, train_loader, opt, device, criterion,
+                               aug_cfg["mixup_alpha"], gen)
+        t, f1 = validate()
+        print(f"[warmup {epoch+1}/{train_cfg['warmup_epochs']}] "
+              f"loss={loss:.4f} val_microF1={f1:.4f}")
+
+    # Phase 2: everything trainable, discriminative LRs + cosine decay.
+    model.unfreeze_backbones()
+    opt = torch.optim.Adam(model.param_groups(train_cfg["backbone_lr"],
+                                              train_cfg["head_lr"]),
+                           weight_decay=train_cfg["weight_decay"])
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+        opt, T_max=train_cfg["finetune_epochs"])
+    for epoch in range(train_cfg["finetune_epochs"]):
+        loss = train_one_epoch(model, train_loader, opt, device, criterion,
+                               aug_cfg["mixup_alpha"], gen)
+        sched.step()
+        t, f1 = validate()
+        print(f"[finetune {epoch+1}/{train_cfg['finetune_epochs']}] "
+              f"loss={loss:.4f} val_microF1={f1:.4f}")
+        checkpoint_if_best(f1, t)
+        if patience >= train_cfg["early_stopping_patience"]:
+            print(f"Early stopping at epoch {epoch+1}")
+            break
+
+    if best_f1 < 0:  # warmup-only runs (e.g. finetune_epochs=0) still checkpoint
+        t, f1 = validate()
+        checkpoint_if_best(f1, t)
+
+    results = {"val_micro_f1": best_f1, "threshold": best_threshold,
+               "branches": config["branches"]}
+
     test_dir = Path(data_cfg["test_dir"])
     if test_dir.exists() and any(test_dir.rglob("*.wav")):
-        model.load_state_dict(torch.load(ckpt_path, map_location="cpu")["model"])
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        model.load_state_dict(ckpt["model"])
         model.to(device)
-        sr, ev = data_cfg["sample_rate"], config["eval"]
+        fc = FeatureConfig.from_config(config)
+        ev = config["eval"]
         y_true, y_scores = gather_test_scores(
-            model, IRMASTestDataset(test_dir, sr), device,
-            int(round(ev["window_seconds"] * sr)), int(round(ev["hop_seconds"] * sr)), ev["aggregate"],
-        )
+            model, IRMASTestDataset(test_dir, fc.sample_rate), device, fc,
+            full_plain.stats, model.active,
+            int(round(ev["window_seconds"] * fc.sample_rate)),
+            int(round(ev["hop_seconds"] * fc.sample_rate)), ev["aggregate"])
         results["test"] = evaluate_scores(y_true, y_scores, best_threshold)
         print("TEST:", results["test"])
 
@@ -154,7 +163,7 @@ def run_training(config: dict) -> dict:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Finetune CNN14 on IRMAS")
+    parser = argparse.ArgumentParser(description="Train MultiBranchNet on IRMAS")
     parser.add_argument("--config", default="configs/default.yaml")
     args = parser.parse_args()
     run_training(load_config(args.config))
