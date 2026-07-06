@@ -1,111 +1,93 @@
-"""IRMAS datasets with lazy, on-demand audio loading.
-
-Nothing is held in RAM up front: each ``__getitem__`` loads exactly one clip
-from disk, converts it to mono at the model's sample rate, and (for training)
-normalizes it to a fixed length. This scales to the full dataset unlike the
-old "load every waveform into a numpy list" approach.
-"""
+"""IRMAS datasets. Training reads precomputed .npz features (lazy, per item,
+only the branches the model actually uses); testing loads raw audio for
+sliding-window evaluation with on-the-fly feature extraction."""
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Callable
 
 import numpy as np
-import soundfile as sf
 import torch
-import torchaudio
 from torch.utils.data import Dataset
 
+from ..features import load_audio, normalize
 from .labels import IRMAS_CLASSES, encode_labels, label_to_index
-from .transforms import pad_or_trim
 
 _VALID_CODES = set(IRMAS_CLASSES)
-
-
-def _load_mono_resampled(path: Path, sample_rate: int) -> torch.Tensor:
-    """Load an audio file as a 1D mono float32 tensor at ``sample_rate``.
-
-    Uses soundfile for decoding (no torchcodec dependency) and torchaudio only
-    for high-quality resampling.
-    """
-    data, sr = sf.read(str(path), dtype="float32", always_2d=True)  # (frames, channels)
-    waveform = torch.from_numpy(np.ascontiguousarray(data.T))  # (channels, frames)
-    if waveform.shape[0] > 1:
-        waveform = waveform.mean(dim=0, keepdim=True)
-    if sr != sample_rate:
-        waveform = torchaudio.functional.resample(waveform, sr, sample_rate)
-    return waveform.squeeze(0).to(torch.float32)
+_IMAGE_KEYS = ("mel", "cqt", "chroma")  # get a leading channel dim
 
 
 def parse_test_label_file(path: Path) -> list[str]:
-    """Read an IRMAS test annotation file into a list of valid instrument codes.
-
-    Annotations list one instrument per line; we split on any whitespace and
-    keep only tokens that are among the 11 IRMAS classes.
-    """
-    text = Path(path).read_text()
-    tokens = text.replace("\t", " ").split()
+    """IRMAS test annotations: one instrument code per line."""
+    tokens = Path(path).read_text().replace("\t", " ").split()
     return [tok for tok in tokens if tok in _VALID_CODES]
 
 
-class IRMASTrainDataset(Dataset):
-    """Single-label training clips, one instrument per folder.
+class IRMASFeaturesDataset(Dataset):
+    """Precomputed-feature training clips (folder-per-class of .npz files).
 
-    Returns ``(waveform[clip_len], target[11])`` where the target is a
-    multi-hot vector (single 1 here) so it composes with mixup and BCE loss.
+    Returns ``(features_dict, target)``: normalized float32 tensors, image-like
+    features shaped (1, bins, T), waveform shaped (clip_len,), multi-hot target.
     """
 
     def __init__(
         self,
-        root: str | os.PathLike,
-        sample_rate: int,
-        clip_seconds: float,
-        transform: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        features_dir: str | os.PathLike,
+        branches: list[str],
+        transform: Callable[[dict[str, torch.Tensor]], dict[str, torch.Tensor]] | None = None,
     ):
-        self.root = Path(root)
-        self.sample_rate = sample_rate
-        self.clip_len = int(round(sample_rate * clip_seconds))
+        self.root = Path(features_dir)
+        self.branches = list(branches)
         self.transform = transform
+        self.stats = json.loads((self.root / "stats.json").read_text())
 
         self.samples: list[tuple[Path, int]] = []
         for code in sorted(os.listdir(self.root)):
             class_dir = self.root / code
             if not class_dir.is_dir() or code not in _VALID_CODES:
                 continue
-            for wav in sorted(class_dir.glob("*.wav")):
-                self.samples.append((wav, label_to_index(code)))
+            for npz in sorted(class_dir.glob("*.npz")):
+                self.samples.append((npz, label_to_index(code)))
+        if not self.samples:
+            raise FileNotFoundError(
+                f"No .npz features under {self.root} — run scripts/preprocess.py first")
 
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
         path, class_idx = self.samples[idx]
-        wav = _load_mono_resampled(path, self.sample_rate)
-        wav = pad_or_trim(wav, self.clip_len)
+        with np.load(path) as npz:
+            raw = {k: npz[k].astype(np.float32) for k in self.branches}
+        normed = normalize(raw, self.stats)
+        feats = {
+            k: torch.from_numpy(v).unsqueeze(0) if k in _IMAGE_KEYS else torch.from_numpy(v)
+            for k, v in normed.items()
+        }
         if self.transform is not None:
-            wav = self.transform(wav)
+            feats = self.transform(feats)
         target = torch.zeros(len(IRMAS_CLASSES), dtype=torch.float32)
         target[class_idx] = 1.0
-        return wav, target
+        return feats, target
 
     def targets(self) -> list[int]:
-        """Class index per sample — handy for a stratified train/val split."""
+        """Class index per sample — for the stratified train/val split."""
         return [class_idx for _, class_idx in self.samples]
 
 
 class IRMASTestDataset(Dataset):
-    """Variable-length polyphonic test clips with multi-label annotations.
+    """Variable-length polyphonic test clips with multi-label .txt annotations.
 
-    Returns ``(waveform[variable], target[11], name)``. Clips are NOT cropped;
-    the sliding-window evaluation handles their variable length.
+    Returns ``(waveform, target, name)``; windowing + feature extraction happen
+    in evaluate.py so train/test share the exact same feature code path.
     """
 
     def __init__(self, root: str | os.PathLike, sample_rate: int):
         self.root = Path(root)
         self.sample_rate = sample_rate
-
         self.samples: list[tuple[Path, Path]] = []
         for wav in sorted(self.root.rglob("*.wav")):
             txt = wav.with_suffix(".txt")
@@ -117,7 +99,6 @@ class IRMASTestDataset(Dataset):
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, str]:
         wav_path, txt_path = self.samples[idx]
-        wav = _load_mono_resampled(wav_path, self.sample_rate)
-        codes = parse_test_label_file(txt_path)
-        target = torch.from_numpy(encode_labels(codes))
+        wav = torch.from_numpy(load_audio(wav_path, self.sample_rate))
+        target = torch.from_numpy(encode_labels(parse_test_label_file(txt_path)))
         return wav, target, wav_path.stem
