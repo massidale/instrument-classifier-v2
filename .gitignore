@@ -13,8 +13,7 @@ dist/
 venv/
 
 # Data & artifacts (large, downloaded/generated — not versioned)
-data/IRMAS-TrainingData/
-data/IRMAS-TestingData*/
+data/
 checkpoints/*.pth
 checkpoints/pretrained/
 runs/
@@ -23,3 +22,6 @@ outputs/
 
 # OS
 .DS_Store
+
+# Session scratch
+.superpowers/

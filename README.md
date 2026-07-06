@@ -1,21 +1,28 @@
-# Instrument Classifier v2 — IRMAS via Transfer Learning
+# Instrument Classifier v2 — IRMAS via a Multi-Input CNN
 
-Musical instrument recognition on the **IRMAS** benchmark, done the modern way:
-finetune a **PANNs CNN14** backbone (pretrained on AudioSet) instead of training a
-tiny CNN from scratch. Multi-label evaluation follows the official IRMAS protocol.
+Musical instrument recognition on the **IRMAS** benchmark with a purpose-built
+**multi-input CNN**. Each audio representation gets its own branch — log-mel and
+CQT spectrograms ride **ImageNet-pretrained ResNet18** backbones, while raw
+waveform and chroma branches are trained from scratch — and their embeddings are
+fused (late fusion) into a shared multi-label head. Because the branches are
+toggleable, the same code doubles as a **per-branch ablation study**.
+Multi-label evaluation follows the official IRMAS protocol.
 
 This is a clean PyTorch rewrite of an older Keras notebook project.
 
 ## Why this design
 
-| Concern | Old project | This project |
-|---|---|---|
-| Model | 2-layer CNN trained from scratch | CNN14 pretrained on AudioSet, finetuned |
-| Features | hand-crafted CQT + mel + chroma + waveform | log-mel computed in-graph (as the backbone expects) |
-| Data loading | everything into RAM as numpy lists | lazy per-item `Dataset` / `DataLoader` |
-| Evaluation | K-Fold on training clips only | official IRMAS multi-label test set, micro/macro-F1 |
-| Reproducibility | none | single YAML config, global seed, saved checkpoints + metrics |
-| Framework | TensorFlow/Keras | PyTorch, installable package, tested |
+| Concern | v1 (Keras) | v2-CNN14 | v2-MultiBranch (this repo) |
+|---|---|---|---|
+| Model | small multi-feature CNN from scratch | single-input CNN14 finetuned | 4-branch multi-input CNN, late fusion |
+| Transfer learning | none | PANNs weights (AudioSet) | ImageNet ResNet18 on mel & CQT branches |
+| Features | CQT + mel + chroma + waveform (into RAM) | log-mel computed in-graph | mel + CQT + waveform + chroma, precomputed to `.npz` |
+| Ablation | none | none | per-branch toggles → contribution table |
+| Data loading | everything into RAM as numpy lists | lazy per-item `Dataset` | lazy `Dataset` over cached features |
+| Evaluation | K-Fold on training clips only | official IRMAS test set, micro/macro-F1 | official IRMAS test set, windowed micro/macro-F1 |
+| Augmentation | none | waveform noise/gain | SpecAugment + multi-input mixup |
+| Reproducibility | none | YAML config + seed | single YAML config, global seed, saved checkpoints + metrics |
+| Framework | TensorFlow/Keras | PyTorch | PyTorch, installable package, tested |
 
 ## Task
 
@@ -31,40 +38,57 @@ conda activate instrument-classifier-v2
 pip install -e .
 ```
 
-## Get the data & pretrained weights
+No pretrained-checkpoint download is needed: torchvision fetches the ResNet18
+ImageNet weights automatically on first use.
+
+## Get the data
 
 ```bash
-# CNN14 AudioSet checkpoint (~300 MB)
-python scripts/download_pretrained.py
-
 # IRMAS training + testing data (~3 GB). Reuse existing training data if you have it:
 python scripts/download_data.py --link-train /path/to/IRMAS-TrainingData
 # ...or download everything:
 python scripts/download_data.py
 ```
 
-## Train & evaluate
+## Pipeline
+
+Three steps, in order. All hyperparameters live in
+[`configs/default.yaml`](configs/default.yaml).
 
 ```bash
-python scripts/train.py --config configs/default.yaml      # finetunes, tunes threshold, evaluates on test
-python scripts/evaluate.py --checkpoint outputs/best.pth   # re-evaluate a saved checkpoint
+# 1. Precompute mel/CQT/chroma/waveform features once (writes .npz + norm stats)
+python scripts/preprocess.py --config configs/default.yaml
+
+# 2. Train: warm up the new head with backbones frozen, then finetune with a
+#    discriminative learning rate; tunes the threshold and evaluates on test
+python scripts/train.py --config configs/default.yaml
+
+# 3. Ablation: retrain across branch combinations and write a comparison table
+python scripts/run_ablation.py --config configs/default.yaml
 ```
 
-All hyperparameters live in [`configs/default.yaml`](configs/default.yaml).
-Training runs in two phases: (1) freeze the backbone and warm up the new head,
-then (2) unfreeze everything with a discriminative learning rate and cosine decay.
+To re-score a saved checkpoint without retraining:
+
+```bash
+python scripts/evaluate.py --config configs/default.yaml --checkpoint outputs/best.pth
+```
+
+Or run the whole thing on a free Colab GPU with
+[`notebooks/colab_train.ipynb`](notebooks/colab_train.ipynb).
 
 ## Project layout
 
 ```
 src/instrument_classifier/
-  data/{labels,transforms,dataset}.py   # vocab, augmentation, lazy IRMAS datasets
-  models/cnn14.py                        # PANNs CNN14 + new head + freeze/LR helpers
+  data/{labels,transforms,dataset}.py   # vocab, SpecAugment/mixup, lazy feature datasets
+  models/multibranch.py                  # MultiBranchNet: 4 toggleable branches + fusion head
+  features.py                            # shared mel/CQT/chroma/waveform extraction
   windowing.py                           # sliding-window split + score aggregation
-  metrics.py                             # micro/macro F1, threshold tuning
+  metrics.py                             # micro/macro/per-class F1, threshold tuning
   train.py / evaluate.py                 # orchestration + CLI
-scripts/                                 # data/weights download + CLI wrappers
-notebooks/colab_train.ipynb              # run training on a free Colab GPU
+scripts/                                 # data download, preprocess, train, evaluate, ablation
+configs/default.yaml                     # every hyperparameter
+notebooks/colab_train.ipynb              # run the pipeline on a free Colab GPU
 tests/                                   # pytest suite (run: pytest)
 ```
 
@@ -74,19 +98,26 @@ tests/                                   # pytest suite (run: pytest)
 pytest
 ```
 
-Covers label encoding, dataset shapes, augmentation, sliding-window aggregation,
-metric correctness, model wiring, and an end-to-end overfit sanity check.
+Covers label encoding, feature extraction, dataset shapes, SpecAugment/mixup,
+sliding-window aggregation, metric correctness, model wiring (branch toggles),
+and an end-to-end training integration test.
 
 ## Results
 
-Filled in after a full training run (`outputs/metrics.json`):
+Filled in after a full training run (`outputs/ablation.md`):
 
-| Metric | Value |
-|---|---|
-| Test micro-F1 | _TBD_ |
-| Test macro-F1 | _TBD_ |
+| Branches | val micro-F1 | test micro-F1 | test macro-F1 |
+|---|---|---|---|
+| mel | _TBD_ | _TBD_ | _TBD_ |
+| mel+cqt | _TBD_ | _TBD_ | _TBD_ |
+| mel+cqt+wave | _TBD_ | _TBD_ | _TBD_ |
+| mel+cqt+wave+chroma | _TBD_ | _TBD_ | _TBD_ |
+
+_TBD after full training run._
 
 ## Credits
 
 - IRMAS dataset — Bosch et al., MTG, Universitat Pompeu Fabra.
-- PANNs / CNN14 — Kong et al., "PANNs: Large-Scale Pretrained Audio Neural Networks", 2020.
+- ResNet — He et al., "Deep Residual Learning for Image Recognition", 2015.
+- SpecAugment — Park et al., "SpecAugment", 2019.
+- mixup — Zhang et al., "mixup: Beyond Empirical Risk Minimization", 2017.

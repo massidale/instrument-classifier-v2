@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""CLI entrypoint: finetune CNN14 on IRMAS. Thin wrapper over the package."""
+"""CLI entrypoint: train MultiBranchNet on IRMAS. Thin wrapper over the package."""
 
 from instrument_classifier.train import main
 
