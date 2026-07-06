@@ -101,7 +101,10 @@ def run_training(config: dict) -> dict:
             best_f1, best_threshold, patience = f1, t, 0
             save_checkpoint(ckpt_path, model, extra={
                 "threshold": best_threshold, "val_micro_f1": best_f1,
-                "branches": config["branches"], "stats": full_plain.stats})
+                "branches": config["branches"], "stats": full_plain.stats,
+                "model_config": {"num_classes": config["model"]["num_classes"],
+                                 "head_hidden": config["model"]["head_hidden"],
+                                 "dropout": config["model"]["dropout"]}})
         else:
             patience += 1
 
@@ -116,6 +119,12 @@ def run_training(config: dict) -> dict:
         t, f1 = validate()
         print(f"[warmup {epoch+1}/{train_cfg['warmup_epochs']}] "
               f"loss={loss:.4f} val_microF1={f1:.4f}")
+        # Checkpoint warmup weights too, so a degrading finetune can't discard a
+        # superior frozen-backbone model.
+        checkpoint_if_best(f1, t)
+
+    # Reset patience so early stopping counts only finetune epochs.
+    patience = 0
 
     # Phase 2: everything trainable, discriminative LRs + cosine decay.
     model.unfreeze_backbones()
@@ -136,7 +145,7 @@ def run_training(config: dict) -> dict:
             print(f"Early stopping at epoch {epoch+1}")
             break
 
-    if best_f1 < 0:  # warmup-only runs (e.g. finetune_epochs=0) still checkpoint
+    if best_f1 < 0:  # no epoch ever checkpointed (warmup=0 and finetune=0)
         t, f1 = validate()
         checkpoint_if_best(f1, t)
 

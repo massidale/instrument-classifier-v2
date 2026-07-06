@@ -27,9 +27,7 @@ def windows_to_inputs(
     """(W, window_len) raw windows -> model input dict, only active branches."""
     per_key: dict[str, list[np.ndarray]] = {k: [] for k in active}
     for w in windows.numpy():
-        feats = normalize(
-            {k: v for k, v in extract_all(w, fc).items() if k in active},
-            stats)
+        feats = normalize(extract_all(w, fc, keys=active), stats)
         for k in active:
             per_key[k].append(feats[k])
     out = {}
@@ -42,6 +40,9 @@ def windows_to_inputs(
 @torch.no_grad()
 def clip_scores(model, waveform, device, fc, stats, active,
                 window_len, hop_len, aggregate="mean", batch_size=16) -> torch.Tensor:
+    assert window_len == fc.clip_len, (
+        f"eval.window_seconds must equal features.clip_seconds; got "
+        f"window_len={window_len} samples vs clip_len={fc.clip_len} samples")
     windows = sliding_windows(waveform, window_len, hop_len)
     probs = []
     for start in range(0, windows.shape[0], batch_size):
@@ -73,13 +74,22 @@ def evaluate_scores(y_true, y_scores, threshold: float) -> dict:
 
 
 def evaluate_from_config(config: dict, checkpoint_path: str | Path) -> dict:
+    test_dir = Path(config["data"]["test_dir"])
+    if not (test_dir.exists() and any(test_dir.rglob("*.wav"))):
+        raise SystemExit(
+            f"No IRMAS test .wav files under {test_dir}; download the test set "
+            f"(scripts/download_data.py) before evaluating.")
+
     device = resolve_device(config["device"])
     ckpt = torch.load(str(checkpoint_path), map_location="cpu", weights_only=False)
+    # Prefer the hyperparameters the checkpoint was trained with; fall back to
+    # the current config for pre-model_config checkpoints.
+    mc = ckpt.get("model_config", config["model"])
     model = MultiBranchNet(branches=ckpt["branches"],
-                           num_classes=config["model"]["num_classes"],
+                           num_classes=mc["num_classes"],
                            pretrained=False,
-                           head_hidden=config["model"]["head_hidden"],
-                           dropout=config["model"]["dropout"])
+                           head_hidden=mc["head_hidden"],
+                           dropout=mc["dropout"])
     model.load_state_dict(ckpt["model"])
     model.to(device).eval()
 

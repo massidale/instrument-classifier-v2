@@ -25,6 +25,19 @@ def test_extract_all_shapes_and_dtype():
     for v in feats.values():
         assert v.dtype == np.float32 and np.isfinite(v).all()
 
+def test_extract_all_subset_keys():
+    """Requesting a subset returns only those keys (skips unwanted CQT/chroma)."""
+    feats = extract_all(_sine(), FC, keys=["mel"])
+    assert set(feats) == {"mel"}
+    assert feats["mel"].shape == (128, 130)
+    assert feats["mel"].dtype == np.float32
+
+def test_extract_all_subset_wave_is_padded():
+    """A shorter clip requested via keys=['wave'] is still padded to clip_len."""
+    feats = extract_all(_sine(seconds=1.0), FC, keys=["wave"])
+    assert set(feats) == {"wave"}
+    assert feats["wave"].shape == (FC.clip_len,)
+
 def test_extract_all_is_deterministic():
     y = _sine()
     a, b = extract_all(y, FC), extract_all(y, FC)

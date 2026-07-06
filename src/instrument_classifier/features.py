@@ -69,11 +69,28 @@ def chroma(y: np.ndarray, fc: FeatureConfig) -> np.ndarray:
         hop_length=fc.hop_length).astype(np.float32)
 
 
-def extract_all(y: np.ndarray, fc: FeatureConfig) -> dict[str, np.ndarray]:
-    """All four representations of one fixed-length clip."""
+_EXTRACTORS = {"mel": logmel, "cqt": cqt, "chroma": chroma}
+
+
+def extract_all(y: np.ndarray, fc: FeatureConfig,
+                keys: list[str] | tuple[str, ...] | None = None) -> dict[str, np.ndarray]:
+    """Requested representations of one fixed-length clip.
+
+    ``keys=None`` returns all four (preprocessing default); pass a subset to
+    skip the expensive extractions (e.g. CQT/chroma) for inactive branches.
+    The waveform is always padded/trimmed to ``fc.clip_len`` first, and "wave"
+    is included in the output only when requested.
+    """
+    if keys is None:
+        keys = FEATURE_KEYS
+    unknown = set(keys) - set(FEATURE_KEYS)
+    if unknown:
+        raise ValueError(f"Unknown feature keys: {sorted(unknown)}")
     y = pad_or_trim_np(y.astype(np.float32), fc.clip_len)
-    return {"mel": logmel(y, fc), "cqt": cqt(y, fc),
-            "chroma": chroma(y, fc), "wave": y}
+    out: dict[str, np.ndarray] = {}
+    for k in keys:
+        out[k] = y if k == "wave" else _EXTRACTORS[k](y, fc)
+    return out
 
 
 def normalize(feats: dict[str, np.ndarray], stats: dict) -> dict[str, np.ndarray]:

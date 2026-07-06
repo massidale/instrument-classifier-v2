@@ -1,10 +1,10 @@
 """End-to-end smoke test on the synthetic dataset: 1 warmup + 2 finetune
-epochs on CPU with pretrained=False must run, save a checkpoint with the new
-format, and improve training loss."""
+epochs on CPU with pretrained=False must run to completion, save a best.pth
+checkpoint in the expected format (model/threshold/val_micro_f1/branches/stats),
+write metrics.json, and return test metrics including per-class F1."""
 import torch
 
 from instrument_classifier.train import run_training
-from conftest import TEST_FC
 
 
 def _config(features_dir, irmas_root, out_dir):
