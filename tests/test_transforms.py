@@ -1,84 +1,44 @@
 import torch
 
-from instrument_classifier.data.transforms import (
-    pad_or_trim,
-    random_gain,
-    add_gaussian_noise,
-    mixup_batch,
-    AugmentTransform,
-)
+from instrument_classifier.data.transforms import SpecAugment, mixup_batch
 
 
-def test_augment_transform_preserves_shape_and_perturbs():
-    wav = torch.ones(2000)
-    aug = AugmentTransform(gain_db=6.0, noise_snr_db=20.0, seed=0)
-    out = aug(wav)
-    assert out.shape == wav.shape
-    assert not torch.equal(out, wav)
+def _feats(b=0):  # deterministic fake batchless features
+    g = torch.Generator().manual_seed(7 + b)
+    return {"mel": torch.rand(1, 128, 130, generator=g) + 1.0,
+            "cqt": torch.rand(1, 84, 130, generator=g) + 1.0,
+            "wave": torch.rand(66150, generator=g) + 1.0}
 
 
-def test_augment_transform_disabled_is_identity():
-    wav = torch.randn(2000)
-    aug = AugmentTransform(gain_db=0.0, noise_snr_db=None, seed=0)
-    out = aug(wav)
-    assert torch.equal(out, wav)
+def test_specaugment_masks_only_spectrograms():
+    aug = SpecAugment(time_masks=2, time_width=20, freq_masks=2, freq_width=12, seed=0)
+    feats = _feats()
+    out = aug({k: v.clone() for k, v in feats.items()})
+    assert (out["mel"] == 0).any() and (out["cqt"] == 0).any()      # masked
+    assert torch.equal(out["wave"], feats["wave"])                   # untouched
+    assert out["mel"].shape == feats["mel"].shape
 
 
-def test_pad_or_trim_pads_short_signal_with_zeros():
-    wav = torch.ones(100)
-    out = pad_or_trim(wav, 160)
-    assert out.shape == (160,)
-    assert torch.all(out[:100] == 1.0)
-    assert torch.all(out[100:] == 0.0)
+def test_specaugment_reproducible_with_seed():
+    a = SpecAugment(2, 20, 2, 12, seed=5)({k: v.clone() for k, v in _feats().items()})
+    b = SpecAugment(2, 20, 2, 12, seed=5)({k: v.clone() for k, v in _feats().items()})
+    assert torch.equal(a["mel"], b["mel"])
 
 
-def test_pad_or_trim_crops_long_signal():
-    wav = torch.arange(500, dtype=torch.float32)
-    out = pad_or_trim(wav, 160)
-    assert out.shape == (160,)
+def test_mixup_consistent_lambda_across_inputs():
+    g = torch.Generator().manual_seed(0)
+    feats = {"mel": torch.stack([torch.zeros(1, 4, 4), torch.ones(1, 4, 4)]),
+             "wave": torch.stack([torch.zeros(8), torch.ones(8)])}
+    targets = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+    mixed, my = mixup_batch(feats, targets, alpha=0.4, generator=g)
+    lam_mel = float(mixed["mel"][0].mean())   # 0*lam + 1*(1-lam) or unchanged
+    lam_wave = float(mixed["wave"][0].mean())
+    assert abs(lam_mel - lam_wave) < 1e-6                     # same lam everywhere
+    assert torch.allclose(my.sum(dim=1), torch.ones(2))       # targets stay convex
 
 
-def test_pad_or_trim_exact_length_is_identity():
-    wav = torch.randn(160)
-    out = pad_or_trim(wav, 160)
-    assert torch.equal(out, wav)
-
-
-def test_random_gain_preserves_shape_and_scales():
-    wav = torch.ones(1000)
-    gen = torch.Generator().manual_seed(0)
-    out = random_gain(wav, max_db=6.0, generator=gen)
-    assert out.shape == wav.shape
-    # A pure gain multiplies every sample by the same positive constant.
-    ratios = out / wav
-    assert torch.allclose(ratios, ratios[0].expand_as(ratios), atol=1e-6)
-    assert ratios[0] > 0
-
-
-def test_add_gaussian_noise_changes_signal_but_keeps_shape():
-    wav = torch.zeros(1000)
-    gen = torch.Generator().manual_seed(0)
-    out = add_gaussian_noise(wav, snr_db=20.0, generator=gen)
-    assert out.shape == wav.shape
-    assert out.abs().sum() > 0  # noise was actually added
-
-
-def test_mixup_with_zero_alpha_is_identity():
-    x = torch.randn(4, 100)
-    y = torch.eye(4)
-    x_out, y_out = mixup_batch(x, y, alpha=0.0)
-    assert torch.equal(x_out, x)
-    assert torch.equal(y_out, y)
-
-
-def test_mixup_produces_convex_combination():
-    x = torch.randn(8, 50)
-    y = torch.zeros(8, 11)
-    y[:, 0] = 1.0
-    gen = torch.Generator().manual_seed(42)
-    x_out, y_out = mixup_batch(x, y, alpha=0.4, generator=gen)
-    assert x_out.shape == x.shape
-    assert y_out.shape == y.shape
-    # Targets stay valid multi-label probabilities.
-    assert torch.all(y_out >= 0.0)
-    assert torch.all(y_out <= 1.0)
+def test_mixup_alpha_zero_is_noop():
+    feats = {"mel": torch.rand(2, 1, 4, 4)}
+    targets = torch.rand(2, 11)
+    mixed, my = mixup_batch(feats, targets, alpha=0.0)
+    assert torch.equal(mixed["mel"], feats["mel"]) and torch.equal(my, targets)
