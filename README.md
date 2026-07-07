@@ -111,9 +111,12 @@ Filled in after a full training run (`outputs/ablation.md`):
 | mel | _TBD_ | _TBD_ | _TBD_ |
 | mel+cqt | _TBD_ | _TBD_ | _TBD_ |
 | mel+cqt+wave | _TBD_ | _TBD_ | _TBD_ |
-| mel+cqt+wave+chroma | _TBD_ | _TBD_ | _TBD_ |
+| mel+cqt+wave+chroma | 0.8454 | 0.5328 | 0.4394 |
 
-_TBD after full training run._
+Full-model run: 3 warmup + 25 finetune epochs, threshold 0.40 tuned on validation.
+Test micro P/R = 0.89/0.38 — precision-heavy, reflecting the known val(mono)/test(polyphonic)
+calibration gap discussed in the evaluation protocol. Per-class F1 ranges from 0.81 (voi)
+and 0.80 (sax) down to 0.00 (cla). Remaining rows pending the ablation study.
 
 ## Credits
 
